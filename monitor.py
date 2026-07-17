@@ -281,7 +281,7 @@ def notify(title: str, body: str, click_url: str | None = None) -> None:
     sent = False
     topic = cfg("NTFY_TOPIC")
     if topic:
-        headers = {"Title": title, "Priority": "high", "Tags": "clapper"}
+        headers = {"Title": title.encode("ascii", "ignore").decode().strip(), "Priority": "high", "Tags": "clapper"}
         if click_url:
             headers["Click"] = click_url
         try:
