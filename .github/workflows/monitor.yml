@@ -1,12 +1,15 @@
+# For the odyssey-70mm-watch repo.
+# Paste as the contents of: .github/workflows/monitor.yml
+
 name: odyssey-70mm-watch
 
 on:
   schedule:
-    - cron: "*/20 * * * *"   # every 20 min (GitHub may add a few min of drift)
-  workflow_dispatch: {}       # manual "Run workflow" button
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write             # to commit state.json back
+  contents: write
 
 concurrency:
   group: showtime-watch
@@ -24,14 +27,16 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run monitor
+      - name: Watch The Odyssey (IMAX 70mm)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          # PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
-          # PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          ALERT_LABEL: "Odyssey IMAX 70mm - Lincoln Sq"
+          DATE_URL_TEMPLATE: "https://www.amctheatres.com/movie-theatres/new-york-city/amc-lincoln-square-13/showtimes?date={date}"
+          REQUEST_DELAY: "2"
         run: python monitor.py
 
       - name: Persist state
+        if: always()
         run: |
           git config user.name "showtime-bot"
           git config user.email "bot@users.noreply.github.com"
