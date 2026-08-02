@@ -68,6 +68,13 @@ DEFAULTS = {
     # with zero matching listings of any format -> assume run window ended).
     "DAYS_AHEAD": "45",
     "EMPTY_STREAK_STOP": "5",
+    # For far-future releases (e.g. presale batches months ahead), set the
+    # date scanning should begin (YYYY-MM-DD). Empty = start today.
+    # DAYS_AHEAD then counts forward from this date.
+    "SCAN_START": "",
+    # Short label used in notification titles, so multiple watchers on the
+    # same phone are distinguishable.
+    "ALERT_LABEL": "Odyssey IMAX 70mm - Lincoln Sq",
     # If auto-discovery of the per-date URL fails, set this manually, e.g.
     # "https://.../showtimes?date={date}"  ({date} -> YYYY-MM-DD)
     "DATE_URL_TEMPLATE": "",
@@ -122,16 +129,28 @@ class Show:
 # Fetching
 # --------------------------------------------------------------------------
 
-def fetch(url: str) -> str:
-    """GET a page while presenting a real-browser TLS/HTTP fingerprint."""
-    r = cf.get(
-        url,
-        impersonate="chrome",
-        timeout=30,
-        headers={"Accept-Language": "en-US,en;q=0.9"},
-    )
-    r.raise_for_status()
-    return r.text
+def fetch(url: str, attempts: int = 3) -> str:
+    """GET a page with a real-browser fingerprint, retrying with growing
+    pauses if AMC's traffic protection rejects a request transiently."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            r = cf.get(
+                url,
+                impersonate="chrome",
+                timeout=30,
+                headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                wait = (2 ** i) * 3 + random.uniform(0, 3)  # ~3-6s then ~6-9s
+                print(f"[warn] fetch {i+1}/{attempts} failed ({e}); retrying in {wait:.0f}s",
+                      file=sys.stderr)
+                time.sleep(wait)
+    raise last  # type: ignore[misc]
 
 
 def polite_sleep() -> None:
@@ -278,10 +297,14 @@ def save_state(path: Path, state: dict) -> None:
 # --------------------------------------------------------------------------
 
 def notify(title: str, body: str, click_url: str | None = None) -> None:
-    sent = False
+    # ntfy transmits the Title header as latin-1; strip emoji/non-ascii or the
+    # send fails. (Tags: clapper renders the emoji on the phone instead.)
+    title = title.encode("ascii", "ignore").decode().strip()
+    configured = False
     topic = cfg("NTFY_TOPIC")
     if topic:
-        headers = {"Title": title.encode("ascii", "ignore").decode().strip(), "Priority": "high", "Tags": "clapper"}
+        configured = True
+        headers = {"Title": title, "Priority": "high", "Tags": "clapper"}
         if click_url:
             headers["Click"] = click_url
         try:
@@ -296,6 +319,7 @@ def notify(title: str, body: str, click_url: str | None = None) -> None:
             print(f"[warn] ntfy send failed: {e}", file=sys.stderr)
 
     if cfg("PUSHOVER_TOKEN") and cfg("PUSHOVER_USER"):
+        configured = True
         try:
             cf.post(
                 "https://api.pushover.net/1/messages.json",
@@ -313,8 +337,10 @@ def notify(title: str, body: str, click_url: str | None = None) -> None:
         except Exception as e:
             print(f"[warn] pushover send failed: {e}", file=sys.stderr)
 
-    if not sent:
+    if not configured:
         print("[info] no notifier configured (set NTFY_TOPIC and/or Pushover vars); printing only")
+    elif not sent:
+        print("[warn] notifier configured but send failed -- see warnings above", file=sys.stderr)
     print(f"--- {title} ---\n{body}\n")
 
 
@@ -338,7 +364,15 @@ def scan(dump_dir: Path | None) -> list[Show]:
     empty_stop = int(cfg("EMPTY_STREAK_STOP"))
 
     today = date.today()
-    base_html = fetch(base_url)
+    start = today
+    if cfg("SCAN_START"):
+        start = max(date.fromisoformat(cfg("SCAN_START")), today)
+    try:
+        base_html = fetch(base_url)
+    except Exception as e:
+        sys.exit(f"[error] Couldn't load the theatre page even with retries ({e}). "
+                 "AMC is likely rate-limiting this computer right now; "
+                 "the next scheduled run will try again automatically.")
     if dump_dir:
         (dump_dir / "base.html").write_text(base_html)
 
@@ -352,26 +386,38 @@ def scan(dump_dir: Path | None) -> list[Show]:
         )
     print(f"[info] date url template: {template}")
 
-    all_shows: list[Show] = parse_showtimes(base_html, today.isoformat(), base_url)
+    all_shows: list[Show] = []
+    fetch_failures = 0
+    if start == today:  # the base page shows today's schedule
+        all_shows = parse_showtimes(base_html, today.isoformat(), base_url)
+    started = any(movie_re.search(s.movie) for s in all_shows)
     empty_streak = 0
-    for i in range(1, days_ahead + 1):
-        d = (today + timedelta(days=i)).isoformat()
+    first = 1 if start == today else 0
+    for i in range(first, days_ahead + 1):
+        d = (start + timedelta(days=i)).isoformat()
         polite_sleep()
         try:
             html = fetch(template.format(date=d))
         except Exception as e:
             print(f"[warn] fetch failed for {d}: {e}", file=sys.stderr)
+            fetch_failures += 1
+            if fetch_failures >= 3:
+                sys.exit("[error] 3 dates in a row failed even with retries -- "
+                         "AMC is likely rate-limiting this computer right now. "
+                         "The next scheduled run will try again automatically.")
             continue
         if dump_dir:
             (dump_dir / f"{d}.html").write_text(html)
+        fetch_failures = 0
         day_shows = parse_showtimes(html, d, base_url)
         all_shows.extend(day_shows)
 
         # Early stop once the movie disappears from the schedule entirely
         # for `empty_stop` consecutive days (end of released window).
         if any(movie_re.search(s.movie) for s in day_shows):
+            started = True
             empty_streak = 0
-        else:
+        elif started:  # gaps before the first listed date don't end the scan
             empty_streak += 1
             if empty_streak >= empty_stop:
                 print(f"[info] no listings for {empty_streak} consecutive days; stopping at {d}")
@@ -416,16 +462,17 @@ def main() -> None:
     if first_run:
         days = sorted({s.day for s in current})
         span = f"{days[0]} → {days[-1]}" if days else "none yet"
+        label = cfg("ALERT_LABEL")
         msg = (f"Monitoring started. Currently tracking {len(current)} "
-               f"IMAX 70mm showtimes ({span}). You'll be pinged when new ones drop.")
+               f"showtimes ({span}). You'll be pinged when new ones drop.")
         if not args.dry_run:
-            notify("🎬 Odyssey 70mm watch is live", msg, cfg("THEATRE_SHOWTIMES_URL"))
+            notify(f"{label}: watch is live", msg, cfg("THEATRE_SHOWTIMES_URL"))
         else:
             print(msg)
         return
 
     if new:
-        title = f"🎬 {len(new)} new Odyssey IMAX 70mm showtime{'s' if len(new) > 1 else ''} — Lincoln Sq"
+        title = f"{len(new)} new showtime{'s' if len(new) > 1 else ''}: {cfg('ALERT_LABEL')}"
         body = format_new_shows(new)
         if not args.dry_run:
             notify(title, body, new[0].url)
